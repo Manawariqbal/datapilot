@@ -1,0 +1,12 @@
+pandas
+numpy
+scikit-learn
+scipy
+matplotlib
+streamlit
+pydantic
+langgraph
+langchain
+langchain-ollama
+tabpfn
+python-dotenv
