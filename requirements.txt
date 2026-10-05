@@ -10,3 +10,4 @@ langchain
 langchain-ollama
 tabpfn
 python-dotenv
+python-dotenv
