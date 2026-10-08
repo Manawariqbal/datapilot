@@ -29,7 +29,6 @@ def main():
     print("=" * 60)
 
     for key, value in result.items():
-
         print(
             f"{key}: {value}"
         )
