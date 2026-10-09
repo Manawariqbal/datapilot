@@ -25,6 +25,9 @@ class DataPilotState(TypedDict, total=False):
     # Deterministic comparison between models.
     model_evidence: dict
 
+    # Deterministic statistical feature analysis.
+    feature_evidence: dict
+
     completed_tools: list[str]
 
     step: int

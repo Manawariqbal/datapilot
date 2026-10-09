@@ -1,3 +1,4 @@
+
 from langgraph.graph import END, START, StateGraph
 
 from datapilot.agent.report import generate_final_report
@@ -5,6 +6,7 @@ from datapilot.agent.report import generate_final_report
 from datapilot.agent.nodes import (
     baseline_node,
     eda_node,
+    feature_analysis_node,
     scientist_node,
     tabpfn_node,
 )
@@ -46,6 +48,9 @@ def route_after_scientist(state):
         if "run_tabpfn" not in completed:
             return "tabpfn"
 
+        if "run_feature_analysis" not in completed:
+            return "feature_analysis"
+
         return "finish"
 
     # ------------------------------------
@@ -60,6 +65,9 @@ def route_after_scientist(state):
 
     if action == "run_tabpfn":
         return "tabpfn"
+
+    if action == "run_feature_analysis":
+        return "feature_analysis"
 
     return "finish"
 
@@ -121,6 +129,11 @@ def build_graph():
     )
 
     graph.add_node(
+        "feature_analysis",
+        feature_analysis_node
+    )
+
+    graph.add_node(
         "report",
         generate_final_report
     )
@@ -145,6 +158,7 @@ def build_graph():
             "eda": "eda",
             "baseline": "baseline",
             "tabpfn": "tabpfn",
+            "feature_analysis": "feature_analysis",
             "finish": "report",
         },
     )
@@ -189,6 +203,19 @@ def build_graph():
     )
 
     # ------------------------------------
+    # Feature analysis routing
+    # ------------------------------------
+
+    graph.add_conditional_edges(
+        "feature_analysis",
+        route_after_tool,
+        {
+            "scientist": "scientist",
+            "finish": "report",
+        },
+    )
+
+    # ------------------------------------
     # Final report
     # ------------------------------------
 
@@ -198,3 +225,4 @@ def build_graph():
     )
 
     return graph.compile()
+

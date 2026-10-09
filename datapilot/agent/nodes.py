@@ -1,13 +1,17 @@
+
 from datapilot.agent.llm import get_llm
 from datapilot.eda import run_eda
 from datapilot.models import run_baseline
 from datapilot.tabpfn_tool import run_tabpfn
+from datapilot.feature_analysis import analyze_numeric_features
+from datapilot.evidence import evaluate_model_comparison
 
 
 ALLOWED_ACTIONS = {
     "run_eda",
     "run_baseline",
     "run_tabpfn",
+    "run_feature_analysis",
     "finish",
 }
 
@@ -24,6 +28,9 @@ def get_next_missing_action(
 
     if "run_tabpfn" not in completed_tools:
         return "run_tabpfn"
+
+    if "run_feature_analysis" not in completed_tools:
+        return "run_feature_analysis"
 
     return "finish"
 
@@ -47,6 +54,11 @@ def scientist_node(state):
         or {}
     )
 
+    feature_evidence = (
+        state.get("feature_evidence")
+        or {}
+    )
+
     evidence_text = "\n".join(
         [
             str(item)
@@ -66,6 +78,15 @@ def scientist_node(state):
     else:
         model_evidence_text = (
             "No model comparison evidence available yet."
+        )
+
+    if feature_evidence:
+        feature_evidence_text = str(
+            feature_evidence
+        )
+    else:
+        feature_evidence_text = (
+            "No feature analysis evidence available yet."
         )
 
     prompt = f"""
@@ -103,19 +124,26 @@ STRICT SCIENTIFIC RULES
    - numeric summaries
    - categorical summaries
    - target summary
-   - correlations
+   - feature-target correlations
    - p-values
    - data quality flags
 
 6. The baseline tool trains a baseline ML model.
 
-7. Do not claim causation from correlation.
+7. The feature analysis tool performs:
+   - Pearson correlation
+   - p-value calculation
+   - direction detection
+   - statistical significance classification
+   - sample size reporting
 
-8. If a tool has already been completed, NEVER select it.
+8. Do not claim causation from correlation.
 
-9. If sufficient evidence already exists, choose finish.
+9. If a tool has already been completed, NEVER select it.
 
-10. Use the actual evidence below when making decisions.
+10. If sufficient evidence already exists, choose finish.
+
+11. Use the actual evidence below when making decisions.
 
 ============================================================
 DATASET
@@ -146,6 +174,12 @@ MODEL COMPARISON EVIDENCE
 {model_evidence_text}
 
 ============================================================
+FEATURE ANALYSIS EVIDENCE
+============================================================
+
+{feature_evidence_text}
+
+============================================================
 AVAILABLE ACTIONS
 ============================================================
 
@@ -172,6 +206,22 @@ run_tabpfn
 Runs TabPFN and returns model evaluation metrics.
 
 It does NOT perform additional EDA or statistical analysis.
+
+
+run_feature_analysis
+
+Runs deterministic Pearson correlation analysis between
+numeric features and the numeric target.
+
+Returns:
+
+- correlation
+- p-value
+- direction
+- statistical significance
+- sample size
+
+It does NOT establish causation.
 
 
 finish
@@ -267,16 +317,29 @@ Do not include anything else.
             f"🔒 Python changed action to: {action}"
         )
 
+    # Enforce the baseline-before-TabPFN dependency so that
+    # model comparison always has a baseline result available.
+    if (
+        action == "run_tabpfn"
+        and "run_baseline" not in completed_tools
+    ):
+        action = "run_baseline"
+
+        print(
+            "🔒 Python enforced prerequisite: "
+            "run_baseline must run before run_tabpfn."
+        )
+
     return {
         "next_action": action,
         "hypothesis": hypothesis,
         "reasoning": reasoning,
 
-        # IMPORTANT:
         # Explicitly preserve state.
         "completed_tools": completed_tools,
         "evidence": evidence,
         "model_evidence": model_evidence,
+        "feature_evidence": feature_evidence,
 
         "step": state.get(
             "step",
@@ -344,6 +407,12 @@ def eda_node(state):
             or {}
         ),
 
+        # Preserve feature evidence.
+        "feature_evidence": (
+            state.get("feature_evidence")
+            or {}
+        ),
+
         "step": state.get(
             "step",
             0
@@ -408,6 +477,11 @@ def baseline_node(state):
             or {}
         ),
 
+        "feature_evidence": (
+            state.get("feature_evidence")
+            or {}
+        ),
+
         "step": state.get(
             "step",
             0
@@ -424,8 +498,160 @@ def tabpfn_node(state):
     target = state["target"]
 
     evidence = list(
+        state.get("evidence") or []
+    )
+
+    completed_tools = list(
+        state.get("completed_tools") or []
+    )
+
+    model_evidence = (
+        state.get("model_evidence") or {}
+    )
+
+    feature_evidence = (
+        state.get("feature_evidence") or {}
+    )
+
+    # ------------------------------------------------------------
+    # RUN TABPFN
+    # ------------------------------------------------------------
+
+    try:
+        result = run_tabpfn(
+            df,
+            target
+        )
+
+        print("TabPFN completed.")
+        print("Result:")
+        print(result)
+
+    except Exception as exc:
+        result = {
+            "status": "failed",
+            "model": "TabPFN",
+            "problem_type": state.get("problem_type"),
+            "error": str(exc),
+        }
+
+        print("⚠️ TabPFN failed:")
+        print(exc)
+
+    # ------------------------------------------------------------
+    # APPEND TABPFN RESULT TO UNIFIED EVIDENCE
+    # ------------------------------------------------------------
+
+    evidence.append({
+        "tool": "run_tabpfn",
+        "hypothesis": state.get("hypothesis", ""),
+        "reasoning": state.get("reasoning", ""),
+        "result": result,
+    })
+
+    if "run_tabpfn" not in completed_tools:
+        completed_tools.append("run_tabpfn")
+
+    # ------------------------------------------------------------
+    # FIND THE BASELINE RESULT
+    # ------------------------------------------------------------
+
+    baseline_result = None
+
+    for item in evidence:
+        if item.get("tool") == "run_baseline":
+            candidate = item.get("result") or {}
+
+            if (
+                "error" not in candidate
+                and candidate.get("status") != "failed"
+            ):
+                baseline_result = candidate
+
+            break
+
+    # ------------------------------------------------------------
+    # CALCULATE DETERMINISTIC MODEL COMPARISON
+    # ------------------------------------------------------------
+
+    tabpfn_succeeded = (
+        "error" not in result
+        and result.get("status") != "failed"
+        and ("accuracy" in result or "r2" in result)
+    )
+
+    if baseline_result is not None and tabpfn_succeeded:
+        model_evidence = evaluate_model_comparison([
+            baseline_result,
+            result,
+        ])
+
+        print()
+        print("===== MODEL COMPARISON =====")
+        print(model_evidence)
+
+        evidence.append({
+            "tool": "evaluate_model_comparison",
+            "hypothesis": (
+                "Compare baseline and TabPFN performance "
+                "using deterministic evaluation metrics."
+            ),
+            "reasoning": (
+                "Both model results are available. Python calculates "
+                "metric differences and identifies the metric winners."
+            ),
+            "result": model_evidence,
+        })
+    else:
+        print(
+            "Model comparison skipped: successful baseline and "
+            "TabPFN results with compatible metrics are required."
+        )
+
+    # ------------------------------------------------------------
+    # RETURN UPDATED STATE
+    # ------------------------------------------------------------
+
+    return {
+        "evidence": evidence,
+        "completed_tools": completed_tools,
+        "model_evidence": model_evidence,
+        "feature_evidence": feature_evidence,
+        "step": state.get("step", 0) + 1,
+    }
+
+
+def feature_analysis_node(state):
+
+    print()
+    print("===== RUNNING FEATURE ANALYSIS =====")
+
+    df = state["df"]
+    target = state["target"]
+
+    result = analyze_numeric_features(
+        df,
+        target,
+    )
+
+    evidence = list(
         state.get("evidence")
         or []
+    )
+
+    evidence.append(
+        {
+            "tool": "run_feature_analysis",
+            "hypothesis": state.get(
+                "hypothesis",
+                ""
+            ),
+            "reasoning": state.get(
+                "reasoning",
+                ""
+            ),
+            "result": result,
+        }
     )
 
     completed_tools = list(
@@ -433,66 +659,24 @@ def tabpfn_node(state):
         or []
     )
 
-    try:
-
-        result = run_tabpfn(
-            df,
-            target
-        )
-
-        print("TabPFN completed.")
-
-        print("Result:")
-        print(result)
-
-        evidence.append(
-            {
-                "tool": "run_tabpfn",
-                "hypothesis": state.get(
-                    "hypothesis",
-                    ""
-                ),
-                "reasoning": state.get(
-                    "reasoning",
-                    ""
-                ),
-                "result": result,
-            }
-        )
-
-    except Exception as exc:
-
-        result = {
-            "error": str(exc)
-        }
-
-        print("⚠️ TabPFN failed:")
-        print(exc)
-
-        evidence.append(
-            {
-                "tool": "run_tabpfn",
-                "hypothesis": state.get(
-                    "hypothesis",
-                    ""
-                ),
-                "reasoning": state.get(
-                    "reasoning",
-                    ""
-                ),
-                "result": result,
-            }
-        )
-
-    if "run_tabpfn" not in completed_tools:
+    if "run_feature_analysis" not in completed_tools:
         completed_tools.append(
-            "run_tabpfn"
+            "run_feature_analysis"
         )
+
+    print("Feature analysis completed.")
+
+    print("Result:")
+    print(result)
 
     return {
         "evidence": evidence,
         "completed_tools": completed_tools,
 
+        # Store the latest structured feature analysis.
+        "feature_evidence": result,
+
+        # Preserve model evidence.
         "model_evidence": (
             state.get("model_evidence")
             or {}

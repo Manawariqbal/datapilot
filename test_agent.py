@@ -1,9 +1,7 @@
+
 import pandas as pd
 
 from datapilot.agent.graph import build_graph
-from datapilot.evidence import evaluate_model_comparison
-from datapilot.models import run_baseline
-from datapilot.tabpfn_tool import run_tabpfn
 
 
 def main():
@@ -20,49 +18,8 @@ def main():
 
     print()
     print("=" * 60)
-    print("PREPARING MODEL EVIDENCE")
+    print("STARTING DATAPILOT")
     print("=" * 60)
-
-    # ============================================================
-    # RUN BASELINE
-    # ============================================================
-
-    baseline = run_baseline(
-        df,
-        target
-    )
-
-    print()
-    print("Baseline:")
-    print(baseline)
-
-    # ============================================================
-    # RUN TABPFN
-    # ============================================================
-
-    tabpfn = run_tabpfn(
-        df,
-        target
-    )
-
-    print()
-    print("TabPFN:")
-    print(tabpfn)
-
-    # ============================================================
-    # CALCULATE MODEL EVIDENCE
-    # ============================================================
-
-    model_evidence = evaluate_model_comparison(
-        [
-            baseline,
-            tabpfn,
-        ]
-    )
-
-    print()
-    print("Model Evidence:")
-    print(model_evidence)
 
     # ============================================================
     # BUILD LANGGRAPH
@@ -82,7 +39,12 @@ def main():
 
         "problem_type": "classification",
 
+        # --------------------------------------------------------
+        # BASIC DATASET PROFILE
+        # --------------------------------------------------------
+
         "profile": {
+
             "rows": len(df),
 
             "columns": len(df.columns),
@@ -107,20 +69,47 @@ def main():
             ),
         },
 
-        # No EDA has been performed by the graph yet.
+        # --------------------------------------------------------
+        # EVIDENCE
+        # --------------------------------------------------------
+
+        # Every tool will append its deterministic
+        # result to this single evidence list.
         "evidence": [],
 
-        # IMPORTANT:
-        # Pass deterministic model evidence
-        # into the agent state.
-        "model_evidence": model_evidence,
+        # --------------------------------------------------------
+        # MODEL EVIDENCE
+        # --------------------------------------------------------
 
-        # These models have already been evaluated
-        # before starting the graph.
-        "completed_tools": [
-            "run_baseline",
-            "run_tabpfn",
-        ],
+        # Model comparison will be populated later.
+        "model_evidence": {},
+
+        # --------------------------------------------------------
+        # FEATURE EVIDENCE
+        # --------------------------------------------------------
+
+        "feature_evidence": {},
+
+        # --------------------------------------------------------
+        # COMPLETED TOOLS
+        # --------------------------------------------------------
+
+        # IMPORTANT:
+        # Nothing has been executed yet.
+        #
+        # The agent will decide:
+        #
+        # run_eda
+        # run_baseline
+        # run_tabpfn
+        # run_feature_analysis
+        #
+        # and each node will update this list.
+        "completed_tools": [],
+
+        # --------------------------------------------------------
+        # AGENT LOOP
+        # --------------------------------------------------------
 
         "step": 0,
 
@@ -128,7 +117,7 @@ def main():
     }
 
     # ============================================================
-    # RUN AGENT
+    # RUN DATAPILOT
     # ============================================================
 
     result = graph.invoke(
@@ -144,6 +133,10 @@ def main():
     print("DATAPILOT AGENT RESULT")
     print("=" * 60)
 
+    # ------------------------------------------------------------
+    # NEXT ACTION
+    # ------------------------------------------------------------
+
     print()
     print("Next action:")
     print(
@@ -151,6 +144,10 @@ def main():
             "next_action"
         )
     )
+
+    # ------------------------------------------------------------
+    # HYPOTHESIS
+    # ------------------------------------------------------------
 
     print()
     print("Hypothesis:")
@@ -160,6 +157,10 @@ def main():
         )
     )
 
+    # ------------------------------------------------------------
+    # REASONING
+    # ------------------------------------------------------------
+
     print()
     print("Reasoning:")
     print(
@@ -167,6 +168,10 @@ def main():
             "reasoning"
         )
     )
+
+    # ------------------------------------------------------------
+    # COMPLETED TOOLS
+    # ------------------------------------------------------------
 
     print()
     print("Completed tools:")
@@ -176,6 +181,10 @@ def main():
         )
     )
 
+    # ------------------------------------------------------------
+    # MODEL EVIDENCE
+    # ------------------------------------------------------------
+
     print()
     print("Model evidence:")
     print(
@@ -184,16 +193,85 @@ def main():
         )
     )
 
+    # ------------------------------------------------------------
+    # FEATURE EVIDENCE
+    # ------------------------------------------------------------
+
     print()
-    print("Evidence:")
+    print("Feature evidence:")
     print(
         result.get(
-            "evidence"
+            "feature_evidence"
         )
     )
 
+    # ------------------------------------------------------------
+    # UNIFIED EVIDENCE
+    # ------------------------------------------------------------
+
+    evidence = (
+        result.get(
+            "evidence"
+        )
+        or []
+    )
+
     print()
-    print("Final report:")
+    print("Evidence count:")
+    print(
+        len(evidence)
+    )
+
+    print()
+    print("Evidence:")
+
+    for item in evidence:
+
+        print()
+        print(
+            f"Tool: {item.get('tool')}"
+        )
+
+        print(
+            "Hypothesis:"
+        )
+
+        print(
+            item.get(
+                "hypothesis"
+            )
+        )
+
+        print(
+            "Reasoning:"
+        )
+
+        print(
+            item.get(
+                "reasoning"
+            )
+        )
+
+        print(
+            "Result:"
+        )
+
+        print(
+            item.get(
+                "result"
+            )
+        )
+
+    # ------------------------------------------------------------
+    # FINAL REPORT
+    # ------------------------------------------------------------
+
+    print()
+    print("=" * 60)
+    print("FINAL REPORT")
+    print("=" * 60)
+
+    print()
     print(
         result.get(
             "final_report"
