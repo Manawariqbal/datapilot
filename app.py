@@ -1,12 +1,14 @@
-
 import hashlib
+import json
+import numbers
+from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 from datapilot.profiling import profile_dataframe
 from datapilot.experiments import run_experiments, save_run
-
 
 # --------------------------------------------------
 # PAGE CONFIG
@@ -77,10 +79,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
 # --------------------------------------------------
 # HELPERS
 # --------------------------------------------------
+
 
 def dataframe_signature(file_bytes):
     """Identify the uploaded dataset so stale results aren't displayed."""
@@ -103,6 +105,303 @@ def format_number(value):
 
 
 # --------------------------------------------------
+# REPORT BUILDER
+# --------------------------------------------------
+# Builds the full experiment report as Markdown. It is shown inside the
+# app (📄 Full report tab), offered as a download, and saved next to the
+# run artifacts. Every lookup uses .get() so a missing key in the results
+# never breaks the report; that section simply says "not available".
+
+# Preferred metric used to name the "best" model (first one present wins).
+PRIMARY_METRICS = ["roc_auc", "f1_weighted", "accuracy", "r2", "rmse", "mae"]
+# For these metrics a smaller value is better.
+LOWER_IS_BETTER = {"rmse", "mae", "mse", "mape", "log_loss"}
+
+
+def format_value(value):
+    """Human-readable text for any scalar that may appear in the results."""
+    if value is None:
+        return "N/A"
+    try:
+        if pd.isna(value):
+            return "N/A"
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, numbers.Integral):
+        return f"{int(value):,}"
+    if isinstance(value, numbers.Real):
+        return f"{float(value):,.4f}"
+    return str(value)
+
+
+def df_to_markdown(frame):
+    """Render a DataFrame as a Markdown table (no extra dependencies)."""
+    if frame is None or frame.empty:
+        return "_No data available._"
+
+    columns = [str(column) for column in frame.columns]
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for row in frame.itertuples(index=False):
+        cells = [
+            format_value(value).replace("|", "\\|").replace("\n", " ")
+            for value in row
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def dict_to_markdown(data):
+    """Render a dict as bullets; nested values become JSON code blocks."""
+    if not data:
+        return "_No data available._"
+
+    lines = []
+    for key, value in data.items():
+        label = str(key).replace("_", " ").capitalize()
+        if isinstance(value, (dict, list, tuple)):
+            lines.append(f"- **{label}**:")
+            lines.append("")
+            lines.append("```json")
+            lines.append(json.dumps(value, indent=2, default=str))
+            lines.append("```")
+            lines.append("")
+        else:
+            lines.append(f"- **{label}**: {format_value(value)}")
+    return "\n".join(lines)
+
+
+def pick_best_model(model_df):
+    """Return the best model by the first available primary metric."""
+    if model_df is None or model_df.empty:
+        return None
+
+    name_col = next(
+        (c for c in ["model", "model_name", "name"] if c in model_df.columns),
+        None,
+    )
+    if name_col is None:
+        return None
+
+    for metric in PRIMARY_METRICS:
+        if metric not in model_df.columns:
+            continue
+        scores = pd.to_numeric(model_df[metric], errors="coerce")
+        if not scores.notna().any():
+            continue
+        lower_is_better = metric in LOWER_IS_BETTER
+        best_idx = scores.idxmin() if lower_is_better else scores.idxmax()
+        return {
+            "model": str(model_df.loc[best_idx, name_col]),
+            "metric": metric,
+            "score": float(scores.loc[best_idx]),
+            "lower_is_better": lower_is_better,
+        }
+    return None
+
+
+def build_report_markdown(results, df, profile, dataset_name, run_dir=None):
+    """Assemble the complete experiment report as a Markdown string."""
+    eda = results.get("eda", {}) or {}
+    models = results.get("models", []) or []
+    model_df = pd.DataFrame(models)
+    comparison = results.get("model_comparison")
+    errors = results.get("errors", []) or []
+    flags = eda.get("quality_flags", []) or []
+
+    missing_values = profile.get("missing_values", {}) or {}
+    missing_cells = int(sum(missing_values.values()))
+    duplicate_rows = int(profile.get("duplicate_rows", 0))
+
+    problem_type = (
+        str(results.get("problem_type", "Not available"))
+        .replace("_", " ")
+        .title()
+    )
+    target = results.get("target", "Not available")
+    best = pick_best_model(model_df)
+
+    conclusion = None
+    comparison_details = None
+    if isinstance(comparison, dict):
+        conclusion = comparison.get("conclusion")
+        comparison_details = {
+            key: value for key, value in comparison.items() if key != "conclusion"
+        }
+    elif comparison:
+        conclusion = str(comparison)
+
+    out = []
+
+    # ---- Title ----
+    out.append("# DataPilot Experiment Report")
+    out.append("")
+    out.append(
+        f"**Dataset:** `{dataset_name}` · "
+        f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
+    out.append("")
+
+    # ---- 1. Executive summary ----
+    out.append("## 1. Executive summary")
+    out.append("")
+    out.append(f"- **Dataset size:** {len(df):,} rows × {len(df.columns):,} columns")
+    out.append(f"- **Target column:** `{target}`")
+    out.append(f"- **Problem type:** {problem_type}")
+    out.append(f"- **Models evaluated:** {len(models)}")
+    if best:
+        direction = "lower is better" if best["lower_is_better"] else "higher is better"
+        out.append(
+            f"- **Best model:** {best['model']} "
+            f"({best['metric']} = {best['score']:.4f}, {direction})"
+        )
+    out.append(f"- **Data-quality flags:** {len(flags)}")
+    out.append(f"- **Experiment errors:** {len(errors)}")
+    out.append("")
+    if conclusion:
+        out.append("**Model comparison conclusion**")
+        out.append("")
+        out.append(str(conclusion))
+        out.append("")
+
+    # ---- 2. Dataset overview ----
+    out.append("## 2. Dataset overview")
+    out.append("")
+    out.append(f"- **Rows:** {len(df):,}")
+    out.append(f"- **Columns:** {len(df.columns):,}")
+    out.append(f"- **Duplicate rows:** {duplicate_rows:,}")
+    out.append(f"- **Missing cells:** {missing_cells:,}")
+    out.append("")
+    out.append("### Columns")
+    out.append("")
+    column_df = pd.DataFrame(
+        {
+            "Column": df.columns.astype(str),
+            "Data type": df.dtypes.astype(str).values,
+            "Unique values": [df[c].nunique(dropna=True) for c in df.columns],
+            "Missing values": [int(df[c].isna().sum()) for c in df.columns],
+            "Missing %": [
+                f"{df[c].isna().sum() / len(df) * 100:.2f}%" for c in df.columns
+            ],
+        }
+    )
+    out.append(df_to_markdown(column_df))
+    out.append("")
+
+    # ---- 3. Data quality ----
+    out.append("## 3. Data quality")
+    out.append("")
+    out.append("### Quality flags")
+    out.append("")
+    if flags:
+        for flag in flags:
+            out.append(f"- ⚠️ {flag}")
+    else:
+        out.append("No major deterministic data-quality flags detected.")
+    out.append("")
+    out.append("### Missing values")
+    out.append("")
+    if missing_cells:
+        missing_df = pd.DataFrame(
+            [
+                {
+                    "Column": column,
+                    "Missing values": int(count),
+                    "Missing %": f"{count / len(df) * 100:.2f}%",
+                }
+                for column, count in missing_values.items()
+                if count > 0
+            ]
+        ).sort_values("Missing values", ascending=False)
+        out.append(df_to_markdown(missing_df))
+    else:
+        out.append("The dataset has no missing cells.")
+    out.append("")
+    out.append("### Duplicate records")
+    out.append("")
+    out.append(f"{duplicate_rows:,} duplicate row(s) found.")
+    out.append("")
+
+    # ---- 4. EDA ----
+    out.append("## 4. Exploratory data analysis")
+    out.append("")
+    out.append("### Target summary")
+    out.append("")
+    out.append(dict_to_markdown(eda.get("target_summary", {})))
+    out.append("")
+    out.append("### Strongest signals (correlation with target)")
+    out.append("")
+    signals = eda.get("correlations_with_target", [])
+    if signals:
+        out.append(df_to_markdown(pd.DataFrame(signals).head(15)))
+    else:
+        out.append("No numeric correlations with the target were returned.")
+    out.append("")
+    out.append(
+        "_Correlations indicate associations, not causation. "
+        "A low correlation does not necessarily mean a feature is useless._"
+    )
+    out.append("")
+
+    # ---- 5. Models ----
+    out.append("## 5. Model results")
+    out.append("")
+    if model_df.empty:
+        out.append("No model metrics were returned by this experiment.")
+    else:
+        out.append(df_to_markdown(model_df))
+        if best:
+            out.append("")
+            out.append(
+                f"**Best model by `{best['metric']}`:** {best['model']} "
+                f"({best['score']:.4f})"
+            )
+    out.append("")
+    if comparison_details:
+        out.append("### Comparison evidence")
+        out.append("")
+        out.append(dict_to_markdown(comparison_details))
+        out.append("")
+
+    # ---- 6. Errors ----
+    out.append("## 6. Errors and warnings")
+    out.append("")
+    if errors:
+        for error in errors:
+            if isinstance(error, (dict, list)):
+                out.append("```json")
+                out.append(json.dumps(error, indent=2, default=str))
+                out.append("```")
+            else:
+                out.append(f"- {error}")
+    else:
+        out.append("No experiment errors were reported.")
+    out.append("")
+
+    # ---- 7. Artifacts ----
+    out.append("## 7. Saved artifacts")
+    out.append("")
+    if run_dir:
+        out.append(f"Run artifacts are saved in `{run_dir}`.")
+    else:
+        out.append("Run artifacts were not saved for this experiment.")
+    out.append("")
+
+    return "\n".join(out)
+
+
+def save_report_file(report_md, run_dir):
+    """Write the report next to the run artifacts as report.md."""
+    path = Path(run_dir) / "report.md"
+    path.write_text(report_md, encoding="utf-8")
+    return path
+
+
+# --------------------------------------------------
 # SIDEBAR
 # --------------------------------------------------
 
@@ -117,6 +416,7 @@ with st.sidebar:
     st.markdown("2. Select the prediction target")
     st.markdown("3. Run experiments")
     st.markdown("4. Review evidence and results")
+    st.markdown("5. Read or download the full report")
 
     st.divider()
 
@@ -126,10 +426,11 @@ with st.sidebar:
     st.markdown("- Baseline model")
     st.markdown("- TabPFN challenger")
     st.markdown("- Model comparison")
+    st.markdown("- Full downloadable report")
 
     st.divider()
-    st.caption("Built with Python, Streamlit and ML tools.")
 
+    st.caption("Built with Python, Streamlit and ML tools.")
 
 # --------------------------------------------------
 # HEADER
@@ -149,7 +450,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-
 # --------------------------------------------------
 # DATASET UPLOAD
 # --------------------------------------------------
@@ -168,7 +468,6 @@ with info_col:
     st.markdown("CSV files containing numerical or categorical columns.")
     st.caption("Choose a target column after uploading your data.")
 
-
 if not uploaded:
     st.markdown("")
     st.markdown("### Get started")
@@ -185,10 +484,9 @@ if not uploaded:
 
     with c3:
         st.markdown("#### 03 · Understand")
-        st.write("Compare model metrics and inspect data signals.")
+        st.write("Compare model metrics, inspect data signals, and get a full report.")
 
     st.stop()
-
 
 # --------------------------------------------------
 # LOAD DATASET
@@ -212,7 +510,6 @@ except Exception as exc:
     st.error(f"Unable to read the CSV: {exc}")
     st.stop()
 
-
 # --------------------------------------------------
 # DATASET SUMMARY
 # --------------------------------------------------
@@ -224,6 +521,7 @@ missing_cells = int(sum(missing_values.values()))
 duplicate_rows = int(profile.get("duplicate_rows", 0))
 
 st.markdown("## Dataset overview")
+
 st.caption(
     f"File: {uploaded.name} · "
     f"{len(df):,} rows · {len(df.columns):,} columns"
@@ -242,11 +540,9 @@ with st.expander("Preview dataset", expanded=True):
         use_container_width=True,
         height=350,
     )
-
     st.caption(
         f"Showing the first {min(20, len(df)):,} of {len(df):,} rows."
     )
-
 
 # --------------------------------------------------
 # DATA QUALITY
@@ -273,6 +569,7 @@ with st.expander("Data quality summary"):
             missing_df = missing_df.sort_values(
                 "Missing values", ascending=False
             )
+
             st.dataframe(
                 missing_df,
                 use_container_width=True,
@@ -301,12 +598,12 @@ with st.expander("Data quality summary"):
             hide_index=True,
         )
 
-
 # --------------------------------------------------
 # EXPERIMENT CONFIGURATION
 # --------------------------------------------------
 
 st.divider()
+
 st.markdown("## Configure experiment")
 
 target = st.selectbox(
@@ -335,7 +632,6 @@ run_clicked = st.button(
     use_container_width=True,
 )
 
-
 # --------------------------------------------------
 # RUN EXPERIMENT
 # --------------------------------------------------
@@ -357,17 +653,27 @@ if run_clicked:
         try:
             run_dir = save_run(results)
             st.session_state["run_dir"] = str(run_dir)
-            st.success(f"Experiment completed. Artifacts saved to `{run_dir}`")
-
         except Exception as exc:
             st.warning(
                 "Experiments completed, but saving artifacts failed: "
                 f"{exc}"
             )
+        else:
+            # Save the full report alongside the run artifacts.
+            try:
+                report_md = build_report_markdown(
+                    results, df, profile, uploaded.name, str(run_dir)
+                )
+                save_report_file(report_md, run_dir)
+                st.success(
+                    f"Experiment completed. Artifacts and report saved to `{run_dir}`"
+                )
+            except Exception as exc:
+                st.success(f"Experiment completed. Artifacts saved to `{run_dir}`")
+                st.warning(f"The report file could not be saved: {exc}")
 
     except Exception as exc:
         st.error(f"The experiment failed: {exc}")
-
 
 # --------------------------------------------------
 # RESULTS DASHBOARD
@@ -379,22 +685,33 @@ if results and st.session_state.get("experiment_key") == experiment_key:
     st.divider()
 
     st.markdown("## Investigation results")
+
     st.caption(
         "Review the experiment evidence below. "
         "Model metrics are calculated by the experiment engine."
     )
 
-    # ---------------- OVERVIEW ----------------
+    # ---------------- TABS ----------------
 
-    overview_tab, quality_tab, eda_tab, models_tab, details_tab = st.tabs(
+    (
+        overview_tab,
+        quality_tab,
+        eda_tab,
+        models_tab,
+        details_tab,
+        report_tab,
+    ) = st.tabs(
         [
             "📊 Overview",
             "🧹 Data quality",
             "🔎 EDA insights",
             "🤖 Model comparison",
             "🧪 Experiment details",
+            "📄 Full report",
         ]
     )
+
+    # ---------------- OVERVIEW ----------------
 
     with overview_tab:
         problem_type = results.get("problem_type", "Not available")
@@ -445,6 +762,11 @@ if results and st.session_state.get("experiment_key") == experiment_key:
             st.caption(
                 f"Saved artifacts: {st.session_state['run_dir']}"
             )
+
+        st.info(
+            "Want every detail in one place? Open the **📄 Full report** tab "
+            "to read the complete report or download it."
+        )
 
     # ---------------- DATA QUALITY ----------------
 
@@ -583,6 +905,7 @@ if results and st.session_state.get("experiment_key") == experiment_key:
 
                     if not chart_df.empty:
                         st.markdown("### Compare metrics")
+
                         selected_metric = st.selectbox(
                             "Select metric",
                             available_metrics,
@@ -593,11 +916,11 @@ if results and st.session_state.get("experiment_key") == experiment_key:
 
                         st.bar_chart(chart_df[[selected_metric]])
 
-            comparison = results.get("model_comparison")
+        comparison = results.get("model_comparison")
 
-            if comparison:
-                st.markdown("### Comparison evidence")
-                st.json(comparison)
+        if comparison:
+            st.markdown("### Comparison evidence")
+            st.json(comparison)
 
     # ---------------- EXPERIMENT DETAILS ----------------
 
@@ -622,9 +945,53 @@ if results and st.session_state.get("experiment_key") == experiment_key:
             st.markdown("### Artifacts")
             st.code(run_dir)
 
-    st.divider()
+        st.divider()
 
-    if st.button("Clear current results"):
-        st.session_state.pop("results", None)
-        st.session_state.pop("run_dir", None)
-        st.rerun()
+        if st.button("Clear current results"):
+            st.session_state.pop("results", None)
+            st.session_state.pop("run_dir", None)
+            st.rerun()
+
+    # ---------------- FULL REPORT ----------------
+
+    with report_tab:
+        report_md = build_report_markdown(
+            results,
+            df,
+            profile,
+            uploaded.name,
+            st.session_state.get("run_dir"),
+        )
+
+        report_stem = Path(uploaded.name).stem
+
+        st.markdown("### Full experiment report")
+        st.caption(
+            "Every detail from this run in one place: dataset overview, "
+            "data quality, EDA, model results, comparison evidence and errors."
+        )
+
+        d1, d2 = st.columns(2)
+
+        d1.download_button(
+            "⬇️ Download report (.md)",
+            data=report_md,
+            file_name=f"datapilot_report_{report_stem}.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+        d2.download_button(
+            "⬇️ Download raw results (.json)",
+            data=json.dumps(results, indent=2, default=str),
+            file_name=f"datapilot_results_{report_stem}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+        st.divider()
+
+        st.markdown(report_md)
+
+        with st.expander("View report as Markdown source"):
+            st.code(report_md, language="markdown")
